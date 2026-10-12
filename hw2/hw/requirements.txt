@@ -10,3 +10,8 @@ Faker>=37.8.0
 
 # Мониторинг
 prometheus-fastapi-instrumentator
+
+# База данных
+sqlalchemy[asyncio]>=2.0.0
+asyncpg
+alembic

@@ -1,92 +1,160 @@
-from typing import Iterable
-from itertools import count
-from shop_api.store.models import ItemEntity, ItemInfo, PatchItemInfo
+from uuid import uuid4
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-_items: dict[int, ItemInfo] = {}
-_carts: dict[int, dict[int, int]] = {}
-
-_item_ids = count(1)
-_cart_ids = count(1)
+from shop_api.store.models import Cart, CartItem, Item
 
 
-def add_item(info: ItemInfo) -> ItemEntity:
-    item_id = next(_item_ids)
-    _items[item_id] = info
-    return ItemEntity(id=item_id, info=info)
+async def add_item(session: AsyncSession, name: str, price: float) -> Item:
+    item = Item(
+        name=name,
+        price=price,
+        description=None,
+        in_stock=True,
+    )
+    session.add(item)
+    await session.commit()
+    await session.refresh(item)
+    return item
 
 
-def get_item(item_id: int) -> ItemEntity | None:
-    if item_id not in _items:
-        return None
-    return ItemEntity(id=item_id, info=_items[item_id])
+async def get_item(session: AsyncSession, item_id: int) -> Item | None:
+    result = await session.execute(select(Item).where(Item.id == item_id))
+    return result.scalar_one_or_none()
 
 
-def get_items(
+async def get_items(
+    session: AsyncSession,
     offset: int = 0,
     limit: int = 10,
     min_price: float | None = None,
     max_price: float | None = None,
     show_deleted: bool = False,
-) -> Iterable[ItemEntity]:
-    result: list[ItemEntity] = []
+) -> list[Item]:
+    stmt = select(Item)
 
-    for item_id, info in _items.items():
-        if not show_deleted and info.deleted:
-            continue
-        if min_price is not None and info.price < min_price:
-            continue
-        if max_price is not None and info.price > max_price:
-            continue
+    if not show_deleted:
+        stmt = stmt.where(Item.in_stock.is_(True))
+    if min_price is not None:
+        stmt = stmt.where(Item.price >= min_price)
+    if max_price is not None:
+        stmt = stmt.where(Item.price <= max_price)
 
-        result.append(ItemEntity(id=item_id, info=info))
-
-    return result[offset : offset + limit]
-
-
-def update_item(item_id: int, info: ItemInfo) -> ItemEntity | None:
-    if item_id not in _items:
-        return None
-    _items[item_id] = info
-    return ItemEntity(id=item_id, info=info)
+    stmt = stmt.order_by(Item.id).offset(offset).limit(limit)
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
 
 
-def patch_item(item_id: int, patch: PatchItemInfo) -> ItemEntity | None:
-    if item_id not in _items:
+async def update_item(
+    session: AsyncSession, item_id: int, name: str, price: float
+) -> Item | None:
+    item = await get_item(session, item_id)
+    if item is None:
         return None
 
-    info = _items[item_id]
-
-    if patch.name is not None:
-        info.name = patch.name
-    if patch.price is not None:
-        info.price = patch.price
-
-    return ItemEntity(id=item_id, info=info)
+    item.name = name
+    item.price = price
+    await session.commit()
+    await session.refresh(item)
+    return item
 
 
-def delete_item(item_id: int) -> None:
-    if item_id in _items:
-        _items[item_id].deleted = True
+async def patch_item(
+    session: AsyncSession,
+    item_id: int,
+    name: str | None = None,
+    price: float | None = None,
+) -> Item | None:
+    item = await get_item(session, item_id)
+    if item is None:
+        return None
+
+    if name is not None:
+        item.name = name
+    if price is not None:
+        item.price = price
+
+    await session.commit()
+    await session.refresh(item)
+    return item
 
 
-def add_cart() -> int:
-    cart_id = next(_cart_ids)
-    _carts[cart_id] = {}
-    return cart_id
+async def delete_item(session: AsyncSession, item_id: int) -> None:
+    item = await get_item(session, item_id)
+    if item is None:
+        return
+
+    item.in_stock = False
+    await session.commit()
 
 
-def get_cart(cart_id: int) -> dict[int, int] | None:
-    return _carts.get(cart_id)
+async def add_cart(session: AsyncSession) -> Cart:
+    cart = Cart(
+        email=f"cart-{uuid4().hex}@example.com",
+        name=f"cart-{uuid4().hex}",
+        age=0,
+    )
+    session.add(cart)
+    await session.commit()
+    await session.refresh(cart)
+    return cart
 
 
-def get_carts() -> Iterable[tuple[int, dict[int, int]]]:
-    return list(_carts.items())
+async def get_cart(session: AsyncSession, cart_id: int) -> Cart | None:
+    result = await session.execute(select(Cart).where(Cart.id == cart_id))
+    return result.scalar_one_or_none()
 
 
-def add_item_to_cart(cart_id: int, item_id: int) -> bool:
-    if cart_id not in _carts or item_id not in _items:
+async def get_cart_items(
+    session: AsyncSession, cart_id: int
+) -> list[tuple[Item, int]]:
+    stmt = (
+        select(Item, CartItem.quantity)
+        .join(CartItem, CartItem.item_id == Item.id)
+        .where(CartItem.cart_id == cart_id)
+        .order_by(Item.id)
+    )
+    result = await session.execute(stmt)
+    return [(row[0], row[1]) for row in result.all()]
+
+
+async def get_all_carts(session: AsyncSession) -> list[Cart]:
+    result = await session.execute(select(Cart).order_by(Cart.id))
+    return list(result.scalars().all())
+
+
+async def add_item_to_cart(
+    session: AsyncSession, cart_id: int, item_id: int
+) -> bool:
+    cart = await get_cart(session, cart_id)
+    if cart is None:
         return False
 
-    cart = _carts[cart_id]
-    cart[item_id] = cart.get(item_id, 0) + 1
+    item = await get_item(session, item_id)
+    if item is None:
+        return False
+
+    result = await session.execute(
+        select(CartItem).where(
+            CartItem.cart_id == cart_id,
+            CartItem.item_id == item_id,
+        )
+    )
+    existing = result.scalar_one_or_none()
+
+    if existing is None:
+        session.add(
+            CartItem(
+                cart_id=cart_id,
+                item_id=item_id,
+                quantity=1,
+                total_price=float(item.price),
+                status="pending",
+            )
+        )
+    else:
+        existing.quantity += 1
+        existing.total_price = float(item.price) * existing.quantity
+
+    await session.commit()
     return True

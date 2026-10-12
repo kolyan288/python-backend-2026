@@ -1,55 +1,61 @@
 from http import HTTPStatus
 from typing import Annotated
-from fastapi import APIRouter, HTTPException, Query, Response
+from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import NonNegativeFloat, NonNegativeInt, PositiveInt
-from shop_api import store
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
+from shop_api import store
+from shop_api.database import get_db
 from .contracts import CartItemResponse, CartResponse
 
 router = APIRouter(prefix="/cart", tags=["cart"])
 
 
-def _build_cart_response(cart_id: int) -> CartResponse:
-    cart = store.get_cart(cart_id)
-
+async def _build_cart_response(
+    session: AsyncSession, cart_id: int
+) -> CartResponse:
+    cart = await store.get_cart(session, cart_id)
     if cart is None:
         raise HTTPException(
             HTTPStatus.NOT_FOUND,
             f"Requested resource /cart/{cart_id} was not found",
         )
 
+    rows = await store.get_cart_items(session, cart_id)
+
     items: list[CartItemResponse] = []
     total_price = 0.0
 
-    for item_id, quantity in cart.items():
-        item = store.get_item(item_id)
-
-        if item is None:
-            continue
-
+    for item, quantity in rows:
         items.append(
             CartItemResponse(
-                id=item_id,
-                name=item.info.name,
+                id=item.id,
+                name=item.name,
                 quantity=quantity,
-                available=not item.info.deleted,
+                available=not item.deleted,
             )
         )
-        total_price += item.info.price * quantity
+        total_price += float(item.price) * quantity
 
     return CartResponse(id=cart_id, items=items, price=total_price)
 
 
 @router.post("/", status_code=HTTPStatus.CREATED)
-async def post_cart(response: Response) -> dict[str, int]:
-    cart_id = store.add_cart()
-    response.headers["location"] = f"/cart/{cart_id}"
-    return {"id": cart_id}
+async def post_cart(
+    response: Response,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, int]:
+    cart = await store.add_cart(session)
+    response.headers["location"] = f"/cart/{cart.id}"
+    return {"id": cart.id}
 
 
 @router.get("/{id}")
-async def get_cart_by_id(id: int) -> CartResponse:
-    return _build_cart_response(id)
+async def get_cart_by_id(
+    id: int,
+    session: AsyncSession = Depends(get_db),
+) -> CartResponse:
+    return await _build_cart_response(session, id)
 
 
 @router.get("/")
@@ -60,12 +66,17 @@ async def get_cart_list(
     max_price: Annotated[NonNegativeFloat | None, Query()] = None,
     min_quantity: Annotated[NonNegativeInt | None, Query()] = None,
     max_quantity: Annotated[NonNegativeInt | None, Query()] = None,
+    session: AsyncSession = Depends(get_db),
 ) -> list[CartResponse]:
-    carts = store.get_carts()
+    carts = await store.get_all_carts(session)
+
     result: list[CartResponse] = []
 
-    for cart_id, _ in carts:
-        cart_response = _build_cart_response(cart_id)
+    for cart in carts:
+        try:
+            cart_response = await _build_cart_response(session, cart.id)
+        except HTTPException:
+            continue
 
         total_quantity = sum(item.quantity for item in cart_response.items)
 
@@ -84,8 +95,12 @@ async def get_cart_list(
 
 
 @router.post("/{cart_id}/add/{item_id}")
-async def add_item_to_cart(cart_id: int, item_id: int) -> CartResponse:
-    ok = store.add_item_to_cart(cart_id, item_id)
+async def add_item_to_cart(
+    cart_id: int,
+    item_id: int,
+    session: AsyncSession = Depends(get_db),
+) -> CartResponse:
+    ok = await store.add_item_to_cart(session, cart_id, item_id)
 
     if not ok:
         raise HTTPException(
@@ -93,4 +108,4 @@ async def add_item_to_cart(cart_id: int, item_id: int) -> CartResponse:
             f"Cart {cart_id} or item {item_id} was not found",
         )
 
-    return _build_cart_response(cart_id)
+    return await _build_cart_response(session, cart_id)
