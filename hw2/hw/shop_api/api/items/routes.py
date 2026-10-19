@@ -65,6 +65,14 @@ async def put_item(
     info: ItemRequest,
     session: AsyncSession = Depends(get_db),
 ) -> ItemResponse:
+    existing = await store.get_item(session, id)
+
+    if existing is None or existing.deleted:
+        raise HTTPException(
+            HTTPStatus.NOT_MODIFIED,
+            f"Requested resource /item/{id} was not found",
+        )
+
     item = await store.update_item(session, id, name=info.name, price=info.price)
 
     if item is None:
